@@ -1,0 +1,171 @@
+# CircleCI configuration for building TensorFlow Python binaries.
+#
+# This workflow builds all py_binary targets under //tensorflow/python/...
+# using a local (non-RBE) CPU build. It mirrors the tag filters used by
+# the upstream linux_cpu_pycpp_test config in .bazelrc, but restricts the
+# Bazel build target pattern to Python binaries only.
+
+version: 2.1
+
+# ─── Reusable executor ───────────────────────────────────────────────────────
+
+executors:
+  linux-x86-build:
+    docker:
+      # Ubuntu-based CircleCI convenience image; gives us apt, curl, etc.
+      - image: cimg/base:stable
+    resource_class: xlarge   # 8 vCPUs / 16 GB RAM
+    environment:
+      # Keep Bazelisk in sync with .bazelversion when upgrading.
+      BAZELISK_VERSION: "1.25.0"
+      PYTHON_VERSION: "3.13"
+      # Non-interactive configure defaults.
+      TF_NEED_CUDA: "0"
+      TF_NEED_ROCM: "0"
+      TF_NEED_CLANG: "0"
+      CC_OPT_FLAGS: "-march=native -Wno-sign-compare"
+
+# ─── Jobs ─────────────────────────────────────────────────────────────────────
+
+jobs:
+  build-python-binaries:
+    executor: linux-x86-build
+    steps:
+      - checkout
+
+      # ── Restore Bazel disk cache ──────────────────────────────────────────
+      - restore_cache:
+          keys:
+            - v1-bazel-py-binaries-{{ .Branch }}-{{ checksum ".bazelversion" }}-{{ checksum "requirements_lock_3_13.txt" }}
+            - v1-bazel-py-binaries-{{ .Branch }}-{{ checksum ".bazelversion" }}-
+            - v1-bazel-py-binaries-{{ .Branch }}-
+            - v1-bazel-py-binaries-
+
+      # ── System dependencies ───────────────────────────────────────────────
+      - run:
+          name: Install system packages
+          command: |
+            sudo apt-get update -q
+            sudo apt-get install -y --no-install-recommends \
+              python3.13 \
+              python3.13-dev \
+              python3.13-venv \
+              python3-pip \
+              build-essential \
+              git \
+              curl \
+              wget \
+              unzip \
+              patch \
+              libssl-dev \
+              zlib1g-dev \
+              openjdk-17-jdk-headless
+
+      # ── Bazelisk (manages the exact Bazel version in .bazelversion) ───────
+      - run:
+          name: Install Bazelisk
+          command: |
+            sudo curl -fsSL \
+              "https://github.com/bazelbuild/bazelisk/releases/download/v${BAZELISK_VERSION}/bazelisk-linux-amd64" \
+              -o /usr/local/bin/bazel
+            sudo chmod +x /usr/local/bin/bazel
+            bazel version   # triggers download of the pinned Bazel release
+
+      # ── Configure TensorFlow (CPU-only, non-interactive) ──────────────────
+      - run:
+          name: Configure TensorFlow (CPU defaults)
+          command: |
+            export PYTHON_BIN_PATH=$(which python3.13)
+            export PYTHON_LIB_PATH="$(python3.13 -c 'import site; print(site.getsitepackages()[0])')"
+            export TF_PYTHON_VERSION="${PYTHON_VERSION}"
+            # Accept all remaining prompts with the default answer.
+            yes "" | python3.13 configure.py
+
+      # ── Collect all py_binary targets ─────────────────────────────────────
+      # Pipe through xargs so the list doesn't hit shell-argument limits.
+      - run:
+          name: Query Python binary targets
+          command: |
+            bazel query \
+              'kind(py_binary, //tensorflow/python/...)' \
+              --keep_going \
+              2>/dev/null \
+              > /tmp/py_binary_targets.txt
+            echo "Found $(wc -l < /tmp/py_binary_targets.txt) py_binary targets."
+            cat /tmp/py_binary_targets.txt
+
+      # ── Build (with FD monitor sidecar) ──────────────────────────────────
+      # Tag filters mirror the upstream linux_cpu_pycpp_test config:
+      #   exclude: no_oss, gpu, tpu, benchmark-test, v1only builds.
+      # Bazel runs in the background; a sidecar loop samples open file
+      # descriptors via /proc/$pid/fd and /proc/$pid/limits every 30 s so
+      # FD exhaustion problems surface in the build log.
+      - run:
+          name: Build Python binaries
+          no_output_timeout: 60m
+          command: |
+            set -euo pipefail
+
+            # Read targets into an array to avoid word-splitting issues.
+            mapfile -t TARGETS < /tmp/py_binary_targets.txt
+
+            bazel build \
+              --config=v2 \
+              --jobs=auto \
+              --build_tag_filters=-no_oss,-gpu,-tpu,-benchmark-test,-v1only \
+              --keep_going \
+              "${TARGETS[@]}" &
+            bazel_pid=$!
+
+            echo "[fd-monitor] Started Bazel with pid=${bazel_pid}"
+            echo "[fd-monitor] Sampling open file descriptors every 30s"
+
+            (
+              while kill -0 "${bazel_pid}" 2>/dev/null; do
+                ts=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+                if [ -d "/proc/${bazel_pid}/fd" ]; then
+                  fd_count=$(ls -1 "/proc/${bazel_pid}/fd" 2>/dev/null | wc -l | tr -d ' ')
+                  fd_limit=$(awk '/Max open files/ {print $4 "/" $5}' \
+                    "/proc/${bazel_pid}/limits" 2>/dev/null || echo "unknown")
+                  echo "[fd-monitor] ${ts} bazel_pid=${bazel_pid} open_fds=${fd_count} max_open_files=${fd_limit}"
+                else
+                  echo "[fd-monitor] ${ts} /proc/${bazel_pid}/fd unavailable"
+                fi
+                sleep 30
+              done
+            ) &
+            fd_monitor_pid=$!
+
+            set +e
+            wait "${bazel_pid}"
+            bazel_exit=$?
+            set -e
+
+            kill "${fd_monitor_pid}" 2>/dev/null || true
+            wait "${fd_monitor_pid}" 2>/dev/null || true
+
+            echo "[fd-monitor] Bazel exited with code ${bazel_exit}"
+            exit "${bazel_exit}"
+
+      # ── Persist built binaries as artifacts ───────────────────────────────
+      - store_artifacts:
+          path: bazel-bin/tensorflow/python
+          destination: python-binaries
+
+      # ── Save Bazel disk cache ─────────────────────────────────────────────
+      - save_cache:
+          key: v1-bazel-py-binaries-{{ .Branch }}-{{ checksum ".bazelversion" }}-{{ checksum "requirements_lock_3_13.txt" }}
+          paths:
+            - ~/.cache/bazel
+
+# ─── Workflows ────────────────────────────────────────────────────────────────
+
+workflows:
+  build-python-binaries:
+    jobs:
+      - build-python-binaries:
+          filters:
+            branches:
+              only:
+                - master
+                - /r2\..*/
